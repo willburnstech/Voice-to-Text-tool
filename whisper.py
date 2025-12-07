@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
 Voice-to-Text Tool: Records audio while hotkey is pressed, transcribes via OpenAI, and pastes the text.
+Now with a Menu Bar interface!
 
 Usage:
-    Run this script to start the global hotkey listener.
-    Press and hold Option + Command + V to record audio (max 30 seconds).
+    Run this script to start the app in the menu bar.
+    Press and hold Right Option to record audio (max 30 seconds).
     Release the hotkey to transcribe and paste the text.
 """
 
 import os
-import time
-import signal
-import tempfile
 import subprocess
 import threading
 import logging
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -23,7 +22,8 @@ from datetime import datetime
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
@@ -35,190 +35,139 @@ try:
     import sounddevice as sd
     import soundfile as sf
     import numpy as np
+    import rumps
+    from openai import OpenAI
 except ImportError as e:
     logger.error(f"Failed to import required dependency: {e}")
     print("Please ensure all dependencies are installed:")
-    print("pip install openai pyperclip pynput python-dotenv sounddevice soundfile numpy setuptools")
+    print("pip install openai pyperclip pynput python-dotenv sounddevice soundfile numpy rumps")
     sys.exit(1)
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Configure OpenAI API with version detection
+# Configure OpenAI API
 openai_api_key = os.getenv('OPENAI_API_KEY')
 if not openai_api_key:
     logger.error("OpenAI API key not found. Please set OPENAI_API_KEY in .env file.")
-    print("Create a .env file with your OpenAI API key: OPENAI_API_KEY=your_key_here")
-    exit(1)
-
-# Initialize OpenAI with version detection
-try:
+    # We'll let the app start but show an alert
+    client = None
+else:
     try:
-        # Try to use pkg_resources if available
-        import pkg_resources
-        import openai
-        openai_version = pkg_resources.get_distribution("openai").version
-        logger.info(f"Detected OpenAI package version: {openai_version}")
-    except ImportError:
-        # Fall back to directly checking the module
-        import openai
-        try:
-            openai_version = openai.__version__
-            logger.info(f"Detected OpenAI version from attribute: {openai_version}")
-        except AttributeError:
-            openai_version = "unknown"
-            logger.warning("Could not determine OpenAI version, assuming legacy")
-    
-    # Handle different OpenAI API versions
-    if str(openai_version).startswith("0."):
-        # Legacy OpenAI API (v0.x)
-        logger.info("Using OpenAI legacy API (v0.x)")
-        openai.api_key = openai_api_key
-        OPENAI_LEGACY = True
-    else:
-        # Modern OpenAI API (v1.x+)
-        logger.info("Using OpenAI modern API (v1.x+)")
-        from openai import OpenAI
         client = OpenAI(api_key=openai_api_key)
-        OPENAI_LEGACY = False
-except Exception as e:
-    # Fall back to legacy as default if detection fails
-    logger.warning(f"Error detecting OpenAI version: {e}")
-    logger.info("Falling back to legacy OpenAI API")
-    import openai
-    openai.api_key = openai_api_key
-    OPENAI_LEGACY = True
+    except Exception as e:
+        logger.error(f"Error initializing OpenAI client: {e}")
+        client = None
 
 # Constants
 SAMPLE_RATE = 16000  # Hz
 MAX_RECORDING_SECONDS = 30
+MIN_RECORDING_SECONDS = 0.5  # Skip accidental taps
 TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+API_MAX_RETRIES = 2
+CACHE_DIR = Path("~/Library/Caches/voice-paste").expanduser()
 
-# Global variables
-recording = False
-audio_data = []
-recording_thread = None
-cache_dir = Path("~/Library/Caches/voice-paste").expanduser()
+# Sounds
+SOUND_START = "/System/Library/Sounds/Tink.aiff"
+SOUND_STOP = "/System/Library/Sounds/Pop.aiff"
+SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
 
+# Import AppKit for Overlay
+try:
+    from AppKit import NSWindow, NSFloatingWindowLevel, NSWindowStyleMaskBorderless, NSBackingStoreBuffered, NSColor, NSTextField, NSFont, NSScreen
+    from PyObjCTools import AppHelper
+    APPKIT_AVAILABLE = True
+except ImportError:
+    logger.warning("AppKit not found, overlay will be disabled")
+    APPKIT_AVAILABLE = False
+
+class OverlayController:
+    """Manages a floating overlay window using AppKit."""
+
+    def __init__(self):
+        self.window = None
+        self.label = None
+        if not APPKIT_AVAILABLE:
+            return
+        try:
+            self._create_window()
+        except Exception as e:
+            logger.error(f"Failed to create overlay: {e}")
+
+    def _create_window(self):
+        # Create a borderless, transparent window
+        screen_rect = NSScreen.mainScreen().frame()
+        width = 300
+        height = 80
+        x = (screen_rect.size.width - width) / 2
+        y = (screen_rect.size.height - height) / 2
+
+        rect = ((x, y), (width, height))
+
+        self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False
+        )
+
+        self.window.setLevel_(NSFloatingWindowLevel)
+        self.window.setBackgroundColor_(NSColor.blackColor().colorWithAlphaComponent_(0.8))
+        self.window.setOpaque_(False)
+        self.window.setHasShadow_(True)
+        self.window.setReleasedWhenClosed_(False)
+
+        # Rounded corners (requires layer)
+        self.window.contentView().setWantsLayer_(True)
+        self.window.contentView().layer().setCornerRadius_(20.0)
+
+        # Label
+        self.label = NSTextField.alloc().initWithFrame_(((0, 0), (width, height)))
+        self.label.setStringValue_("🎙️ Recording...")
+        self.label.setTextColor_(NSColor.whiteColor())
+        self.label.setFont_(NSFont.systemFontOfSize_(24))
+        self.label.setBezeled_(False)
+        self.label.setDrawsBackground_(False)
+        self.label.setEditable_(False)
+        self.label.setSelectable_(False)
+        self.label.setAlignment_(2)  # Center text
+
+        self.window.contentView().addSubview_(self.label)
+
+    def _do_show(self):
+        if self.window:
+            self.window.makeKeyAndOrderFront_(None)
+
+    def _do_hide(self):
+        if self.window:
+            self.window.orderOut_(None)
+
+    def show(self):
+        if self.window and APPKIT_AVAILABLE:
+            try:
+                AppHelper.callAfter(self._do_show)
+            except Exception as e:
+                logger.error(f"Error showing overlay: {e}")
+
+    def hide(self):
+        if self.window and APPKIT_AVAILABLE:
+            try:
+                AppHelper.callAfter(self._do_hide)
+            except Exception as e:
+                logger.error(f"Error hiding overlay: {e}")
+
+def play_sound(sound_path):
+    """Play a system sound asynchronously."""
+    try:
+        if os.path.exists(sound_path):
+            subprocess.Popen(['afplay', sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logger.error(f"Error playing sound: {e}")
 
 def ensure_cache_dir():
     """Ensure cache directory exists."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-
-def record_audio():
-    """Record audio from microphone while hotkey is held."""
-    global recording, audio_data
-    
-    audio_data = []  # Reset audio data
-    
-    def audio_callback(indata, frames, time_info, status):
-        """Callback for audio stream to collect recorded data."""
-        if status:
-            logger.warning(f"Audio status: {status}")
-        if recording:
-            audio_data.append(indata.copy())
-    
-    # Set up the audio stream
-    try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=audio_callback):
-            start_time = time.time()
-            logger.info("Recording started...")
-            
-            while recording and (time.time() - start_time) < MAX_RECORDING_SECONDS:
-                time.sleep(0.1)  # Sleep to reduce CPU usage
-                
-            elapsed = time.time() - start_time
-            if elapsed >= MAX_RECORDING_SECONDS:
-                logger.info(f"Maximum recording time reached ({MAX_RECORDING_SECONDS}s)")
-            
-            logger.info(f"Recording stopped after {elapsed:.2f}s")
-    except Exception as e:
-        logger.error(f"Error in audio recording: {str(e)}")
-    
-    if audio_data:
-        logger.info(f"Recorded {len(audio_data)} audio chunks, processing...")
-        process_audio()
-    else:
-        logger.warning("No audio data captured during recording")
-
-
-def process_audio():
-    """Save recorded audio to file and send to OpenAI for transcription."""
-    if not audio_data:
-        logger.warning("No audio recorded")
-        return
-    
-    # Create a timestamp for the filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    temp_dir = ensure_cache_dir()
-    temp_file = temp_dir / f"voice_recording_{timestamp}.wav"
-    
-    try:
-        # Concatenate audio chunks and save to file
-        audio_concat = np.concatenate(audio_data, axis=0)
-        sf.write(temp_file, audio_concat, SAMPLE_RATE)
-        logger.info(f"Audio saved to: {temp_file}")
-        
-        # Transcribe audio using OpenAI API
-        transcribe_audio(temp_file)
-        
-    except Exception as e:
-        logger.error(f"Error processing audio: {str(e)}")
-    finally:
-        # Cleanup even if transcription fails
-        if temp_file.exists():
-            try:
-                os.remove(temp_file)
-                logger.info(f"Temporary audio file deleted: {temp_file}")
-            except Exception as e:
-                logger.error(f"Error deleting temporary file: {str(e)}")
-
-
-def transcribe_audio(audio_file):
-    """Transcribe audio using OpenAI's API and paste the result."""
-    try:
-        logger.info("Sending audio to OpenAI for transcription...")
-        transcribed_text = None
-        
-        # Open the audio file
-        with open(audio_file, "rb") as file:
-            if OPENAI_LEGACY:
-                # Handle legacy OpenAI API (v0.x)
-                try:
-                    response = openai.Audio.transcribe(
-                        model=TRANSCRIPTION_MODEL,
-                        file=file
-                    )
-                    transcribed_text = response.get("text", "")
-                except Exception as e:
-                    logger.error(f"OpenAI legacy API error: {str(e)}")
-            else:
-                # Handle modern OpenAI API (v1.x+)
-                try:
-                    response = client.audio.transcriptions.create(
-                        model=TRANSCRIPTION_MODEL,
-                        file=file
-                    )
-                    transcribed_text = response.text
-                except Exception as e:
-                    logger.error(f"OpenAI modern API error: {str(e)}")
-        
-        if transcribed_text:
-            logger.info(f"Transcription received: {transcribed_text[:50]}...")
-            
-            # Copy to clipboard
-            pyperclip.copy(transcribed_text)
-            
-            # Programmatically paste with Cmd+V
-            paste_text()
-        else:
-            logger.warning("Received empty transcription from OpenAI")
-    
-    except Exception as e:
-        logger.error(f"Transcription error: {str(e)}")
-
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR
 
 def paste_text():
     """Programmatically trigger Cmd+V to paste the clipboard contents."""
@@ -227,149 +176,280 @@ def paste_text():
         cmd = ['osascript', '-e', 'tell application "System Events" to keystroke "v" using command down']
         subprocess.run(cmd, check=True)
         logger.info("Text pasted successfully")
-    
     except subprocess.CalledProcessError as e:
         logger.error(f"Error pasting text: {e}")
 
+class VoiceRecorder:
+    """Thread-safe voice recorder with persistent audio stream."""
 
-def is_v_key(key):
-    """Check if a key is the 'v' key, including different representations."""
-    try:
-        # Check for direct character match (v or V)
-        if hasattr(key, 'char') and key.char and key.char.lower() == 'v':
-            return True
+    def __init__(self, app_callback=None, overlay=None):
+        self.recording = False
+        self.processing = False
+        self.audio_data = []
+        self.lock = threading.Lock()
+        self.stream = None
+        self.app_callback = app_callback
+        self.overlay = overlay
+        self.running = True
         
-        # Check for special symbols that might be v on some keyboard layouts (√, ◊, etc.)
-        if hasattr(key, 'char') and key.char in ['√', '◊', 'v', 'V']:
-            return True
-        
-        # Check for vk code on some systems
-        if hasattr(key, 'vk') and key.vk == 86:  # 86 is the virtual key code for 'v'
-            return True
+        # Start the persistent audio stream
+        self._start_stream()
+
+    def _start_stream(self):
+        """Start the persistent audio stream."""
+        try:
+            self.stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, 
+                channels=1, 
+                callback=self._audio_callback
+            )
+            self.stream.start()
+            logger.info("Audio stream started and ready")
+        except Exception as e:
+            logger.error(f"Failed to start audio stream: {e}")
+            self.update_status("error")
+
+    def _audio_callback(self, indata, _frames, _time_info, status):
+        """Callback for audio stream to collect recorded data."""
+        if status:
+            logger.warning(f"Audio status: {status}")
+
+        # Only collect data if we are actively recording
+        if self.recording:
+            with self.lock:
+                # Enforce max recording limit
+                current_samples = sum(len(chunk) for chunk in self.audio_data)
+                if current_samples >= MAX_RECORDING_SECONDS * SAMPLE_RATE:
+                    logger.info("Max recording time reached, stopping...")
+                    threading.Thread(target=self.stop_recording).start()
+                    return
+                self.audio_data.append(indata.copy())
+
+    def update_status(self, status):
+        """Update app status via callback."""
+        if self.app_callback:
+            self.app_callback(status)
+
+    def is_recording(self):
+        with self.lock:
+            return self.recording
+
+    def is_busy(self):
+        with self.lock:
+            return self.recording or self.processing
+
+    def start_recording(self):
+        """Start recording immediately."""
+        with self.lock:
+            if self.recording or self.processing:
+                return False
             
-        # Check KeyCode directly
-        if key == keyboard.KeyCode.from_char('v') or key == keyboard.KeyCode.from_char('V'):
-            return True
-    except:
-        pass
-    
-    return False
+            self.recording = True
+            self.processing = False
+            self.audio_data = []
+            logger.info("Starting recording...")
 
+        self.update_status("recording")
+        if self.overlay:
+            self.overlay.show()
+        play_sound(SOUND_START)
+        return True
 
-def on_key_press(key):
-    """Handle key press event."""
-    global recording, recording_thread
-    
-    # Check if Option + Command + V is pressed (macOS)
-    try:
-        cmd_keys = [keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r]
-        alt_keys = [keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r]
+    def stop_recording(self):
+        """Stop recording and trigger processing."""
+        with self.lock:
+            if not self.recording:
+                return
+            self.recording = False
+            logger.info("Stop recording requested")
         
-        if (key in cmd_keys and any(k in alt_keys for k in currently_pressed_keys) and 
-            any(is_v_key(k) for k in currently_pressed_keys)):
-            start_recording()
-        elif (key in alt_keys and any(k in cmd_keys for k in currently_pressed_keys) and 
-              any(is_v_key(k) for k in currently_pressed_keys)):
-            start_recording()
-        elif (is_v_key(key) and any(k in cmd_keys for k in currently_pressed_keys) and 
-              any(k in alt_keys for k in currently_pressed_keys)):
-            start_recording()
-    except:
-        pass
-    
-    # Add key to currently pressed keys
-    currently_pressed_keys.add(key)
-
-
-def on_key_release(key):
-    """Handle key release event."""
-    global recording
-    
-    # Remove key from currently pressed keys
-    try:
-        currently_pressed_keys.remove(key)
-    except KeyError:
-        pass
-    
-    # Check if any part of the hotkey is released while recording
-    try:
-        cmd_keys = [keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r]
-        alt_keys = [keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r]
+        if self.overlay:
+            self.overlay.hide()
+        play_sound(SOUND_STOP)
+        self.update_status("processing")
         
-        if recording and (key in cmd_keys or key in alt_keys or is_v_key(key)):
-            recording = False
-    except:
-        pass
+        # Process in a separate thread to not block the listener
+        threading.Thread(target=self._process_audio).start()
 
+    def close(self):
+        """Clean up resources."""
+        self.running = False
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                logger.error(f"Error closing stream: {e}")
 
-def start_recording():
-    """Start recording if not already recording."""
-    global recording, recording_thread
-    
-    if not recording:
-        recording = True
-        logger.info("Hotkey combination detected, starting recording")
-        recording_thread = threading.Thread(target=record_audio)
-        recording_thread.daemon = True
-        recording_thread.start()
+    def _process_audio(self):
+        """Save and transcribe."""
+        with self.lock:
+            if not self.audio_data:
+                logger.warning("No audio recorded")
+                self.processing = False
+                self.update_status("idle")
+                return
+            audio_data_copy = self.audio_data.copy()
+            self.audio_data = []
+            self.processing = True
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ensure_cache_dir()
+        temp_file = CACHE_DIR / f"voice_recording_{timestamp}.wav"
 
-def request_permissions():
-    """Request necessary permissions on first run."""
-    # Request microphone permission by attempting a quick audio capture
-    try:
-        logger.info("Requesting microphone permission...")
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, blocksize=1024):
-            time.sleep(0.1)
-        logger.info("Microphone permission granted")
-    except Exception as e:
-        logger.error(f"Error accessing microphone: {str(e)}")
-        print("\n⚠️  Please grant microphone permission in System Settings\n")
-    
-    # For Accessibility permissions, we can only inform the user
-    print("\n⚠️  Important: This tool needs Accessibility permissions to work properly.")
-    print("   Please go to System Settings → Privacy & Security → Accessibility")
-    print("   and add Python or Terminal to the allowed applications.\n")
+        try:
+            audio_concat = np.concatenate(audio_data_copy, axis=0)
+            duration = audio_concat.shape[0] / SAMPLE_RATE
+            logger.info(f"Processing {duration:.2f}s of audio")
 
+            # Skip very short recordings (accidental taps)
+            if duration < MIN_RECORDING_SECONDS:
+                logger.info(f"Recording too short ({duration:.2f}s), skipping")
+                return
 
-def handle_exit(signum, frame):
-    """Clean up on exit."""
-    logger.info("Exiting voice-paste...")
-    keyboard_listener.stop()
-    sys.exit(0)
+            sf.write(temp_file, audio_concat, SAMPLE_RATE)
 
+            self._transcribe_audio(temp_file)
+
+        except Exception as e:
+            logger.error(f"Error processing audio: {str(e)}")
+            play_sound(SOUND_ERROR)
+            self.update_status("error")
+        finally:
+            if temp_file.exists():
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            
+            with self.lock:
+                self.processing = False
+                self.update_status("idle")
+
+    def _transcribe_audio(self, audio_file):
+        """Transcribe with OpenAI, with retry logic."""
+        if not client:
+            logger.error("OpenAI client not initialized")
+            play_sound(SOUND_ERROR)
+            return
+
+        last_error = None
+        for attempt in range(API_MAX_RETRIES + 1):
+            try:
+                if attempt > 0:
+                    logger.info(f"Retry attempt {attempt}/{API_MAX_RETRIES}...")
+                logger.info("Transcribing...")
+                with open(audio_file, "rb") as file:
+                    response = client.audio.transcriptions.create(
+                        model=TRANSCRIPTION_MODEL,
+                        file=file
+                    )
+                    text = response.text
+
+                if text:
+                    logger.info(f"Transcribed: {text[:50]}...")
+                    pyperclip.copy(text)
+                    time.sleep(0.05)  # Small delay to ensure clipboard is ready
+                    paste_text()
+                else:
+                    logger.warning("Empty transcription")
+                return  # Success, exit retry loop
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Transcription attempt failed: {str(e)}")
+                if attempt < API_MAX_RETRIES:
+                    continue  # Try again
+
+        # All retries exhausted
+        logger.error(f"Transcription failed after {API_MAX_RETRIES + 1} attempts: {str(last_error)}")
+        play_sound(SOUND_ERROR)
+
+class HotkeyListener:
+    """Manages keyboard hotkey detection with debounce."""
+
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.listener = None
+        self.key_held = False  # Prevent key repeat triggering multiple starts
+
+    def _on_press(self, key):
+        if key == keyboard.Key.alt_r:
+            if self.key_held:
+                return  # Ignore key repeat
+            self.key_held = True
+            logger.info("Right Option pressed")
+            self.recorder.start_recording()
+
+    def _on_release(self, key):
+        if key == keyboard.Key.alt_r:
+            self.key_held = False
+            logger.info("Right Option released")
+            if self.recorder.is_recording():
+                self.recorder.stop_recording()
+
+    def start(self):
+        self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self.listener.start()
+
+    def stop(self):
+        if self.listener:
+            self.listener.stop()
+
+class VoicePasteApp(rumps.App):
+    def __init__(self):
+        super(VoicePasteApp, self).__init__("🎙️", quit_button=None)
+        self.menu = ["Reset Audio Engine", "Quit"]
+        
+        # Initialize Overlay
+        self.overlay = OverlayController()
+        
+        # Pass overlay to recorder
+        self.recorder = VoiceRecorder(app_callback=self.update_icon, overlay=self.overlay)
+        self.listener = HotkeyListener(self.recorder)
+        self.listener.start()
+        
+        # Check API Key
+        if not client:
+            rumps.alert("Missing OpenAI API Key", "Please set OPENAI_API_KEY in .env file and restart.")
+
+    def update_icon(self, status):
+        """Update menu bar icon based on status."""
+        if status == "recording":
+            self.title = "🔴"
+        elif status == "processing":
+            self.title = "⏳"
+        elif status == "error":
+            self.title = "⚠️"
+            # Reset to idle after a delay
+            rumps.Timer(lambda _: self.reset_icon(), 2).start()
+        else:
+            self.title = "🎙️"
+
+    def reset_icon(self):
+        self.title = "🎙️"
+
+    @rumps.clicked("Reset Audio Engine")
+    def reset_audio(self, _):
+        logger.info("Resetting audio engine...")
+        # Re-initialize recorder if needed, or just clear state
+        with self.recorder.lock:
+            self.recorder.recording = False
+            self.recorder.processing = False
+            self.recorder.audio_data = []
+        self.title = "🎙️"
+        rumps.notification("Voice Paste", "Audio Engine Reset", "Ready to record.")
+
+    @rumps.clicked("Quit")
+    def quit_app(self, _):
+        self.listener.stop()
+        self.recorder.close()
+        self.overlay.hide() # Ensure overlay is hidden
+        rumps.quit_application()
 
 if __name__ == "__main__":
-    print("🎙️ Voice-Paste starting...")
-    print("Hold Option (⌥) + Command (⌘) + V to start recording (max 15s)")
-    print("Release to transcribe and paste")
-    print("Press Ctrl+C to quit")
-    
-    # Set up global key tracking
-    currently_pressed_keys = set()
-    
-    # Request permissions on first run
-    request_permissions()
-    
-    # Set up signal handlers for clean exit
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-    
-    # Set up key listeners for press and release
-    logger.info("Initializing keyboard listener")
-    keyboard_listener = keyboard.Listener(
-        on_press=on_key_press,
-        on_release=on_key_release
-    )
-    keyboard_listener.start()
-    logger.info("Keyboard listener started - waiting for hotkey ⌥ ⌘ V")
-    
-    try:
-        # Keep the main thread alive
-        keyboard_listener.join()
-    except KeyboardInterrupt:
-        print("\nExiting...")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-    finally:
-        keyboard_listener.stop()
+    print("\n🚀 Voice-to-Text App is starting...")
+    print("👀 Look for the 🎙️ icon in your macOS Menu Bar (top right).")
+    print("⌨️  Hotkey: Right Option (Press and Hold)")
+    print("---------------------------------------------------\n")
+    VoicePasteApp().run()

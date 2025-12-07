@@ -1,7 +1,7 @@
 # 🎙️ Voice-Paste — speak, release, and paste 🪄
 
-Python utility for **macOS** that lets you hold **⌥ ⌘ V**, talk (≤ 30 s), and have the transcript pasted wherever your text cursor is.  
-Powered by OpenAI’s **`gpt-4o-transcribe`** speech-to-text model.
+Python utility for **macOS** that lets you hold **Right Option (⌥)**, talk (≤ 30 s), and have the transcript pasted wherever your text cursor is.
+Powered by OpenAI's **`gpt-4o-transcribe`** speech-to-text model.
 
 > **Why?** It’s much faster than typing quick notes, chat replies, TODOs, or email paragraphs.
 
@@ -9,7 +9,7 @@ Powered by OpenAI’s **`gpt-4o-transcribe`** speech-to-text model.
 
 ## ✨ Features
 
-* Global hot-key **⌥ ⌘ V** → record → auto-paste  
+* Global hot-key **Right Option** → record → auto-paste  
 * Uses state-of-the-art OpenAI Audio API (`gpt-4o-transcribe`; fallback toggle for `gpt-4o-mini-transcribe` in code)  
 * Multilingual, noise-robust, punctuation aware  
 * Audio kept only in `~/Library/Caches/voice-paste/` and deleted after transcription  
