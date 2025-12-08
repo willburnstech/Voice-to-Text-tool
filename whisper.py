@@ -455,6 +455,7 @@ class VoiceRecorder:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         ensure_cache_dir()
         temp_file = config.cache_dir / f"voice_recording_{timestamp}.wav"
+        error_occurred = False
 
         try:
             audio_concat = np.concatenate(audio_data_copy, axis=0)
@@ -474,6 +475,7 @@ class VoiceRecorder:
             logger.error(f"Error processing audio: {str(e)}")
             play_sound(config.sound_error)
             self.update_status("error")
+            error_occurred = True
         finally:
             if temp_file.exists():
                 try:
@@ -483,6 +485,8 @@ class VoiceRecorder:
 
             with self.lock:
                 self.processing = False
+            # Only reset to idle if no error occurred
+            if not error_occurred:
                 self.update_status("idle")
 
     def _transcribe_audio(self, audio_file: Path) -> None:
