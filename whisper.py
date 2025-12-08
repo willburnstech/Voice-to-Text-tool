@@ -114,11 +114,22 @@ except ImportError:
 
 
 class OverlayController:
-    """Manages a floating overlay window using AppKit."""
+    """Manages a floating overlay window with timer and audio level meter."""
+
+    # Audio meter characters
+    METER_FILLED = "█"
+    METER_EMPTY = "░"
+    METER_LENGTH = 20
 
     def __init__(self) -> None:
         self.window: Any | None = None
-        self.label: Any | None = None
+        self.title_label: Any | None = None
+        self.meter_label: Any | None = None
+        self.start_time: float = 0.0
+        self.current_level: float = 0.0
+        self.update_timer: threading.Timer | None = None
+        self.is_visible: bool = False
+
         if not APPKIT_AVAILABLE:
             return
         try:
@@ -127,10 +138,10 @@ class OverlayController:
             logger.error(f"Failed to create overlay: {e}")
 
     def _create_window(self) -> None:
-        """Create the overlay window with centered positioning."""
+        """Create the overlay window with timer and level meter."""
         screen_rect = NSScreen.mainScreen().frame()
-        width = 300
-        height = 80
+        width = 280
+        height = 90
         x = (screen_rect.size.width - width) / 2
         y = (screen_rect.size.height - height) / 2
 
@@ -144,27 +155,93 @@ class OverlayController:
         )
 
         self.window.setLevel_(NSFloatingWindowLevel)
-        self.window.setBackgroundColor_(NSColor.blackColor().colorWithAlphaComponent_(0.8))
+        self.window.setBackgroundColor_(NSColor.blackColor().colorWithAlphaComponent_(0.85))
         self.window.setOpaque_(False)
         self.window.setHasShadow_(True)
         self.window.setReleasedWhenClosed_(False)
 
-        # Rounded corners (requires layer)
+        # Rounded corners
         self.window.contentView().setWantsLayer_(True)
-        self.window.contentView().layer().setCornerRadius_(20.0)
+        self.window.contentView().layer().setCornerRadius_(16.0)
 
-        # Label
-        self.label = NSTextField.alloc().initWithFrame_(((0, 0), (width, height)))
-        self.label.setStringValue_("🎙️ Recording...")
-        self.label.setTextColor_(NSColor.whiteColor())
-        self.label.setFont_(NSFont.systemFontOfSize_(24))
-        self.label.setBezeled_(False)
-        self.label.setDrawsBackground_(False)
-        self.label.setEditable_(False)
-        self.label.setSelectable_(False)
-        self.label.setAlignment_(2)  # Center text
+        # Title label (Recording + timer)
+        self.title_label = NSTextField.alloc().initWithFrame_(((0, 40), (width, 40)))
+        self.title_label.setStringValue_("🎙️ Recording... 0:00")
+        self.title_label.setTextColor_(NSColor.whiteColor())
+        self.title_label.setFont_(NSFont.systemFontOfSize_(22))
+        self.title_label.setBezeled_(False)
+        self.title_label.setDrawsBackground_(False)
+        self.title_label.setEditable_(False)
+        self.title_label.setSelectable_(False)
+        self.title_label.setAlignment_(2)  # Center
 
-        self.window.contentView().addSubview_(self.label)
+        # Audio level meter label
+        self.meter_label = NSTextField.alloc().initWithFrame_(((0, 12), (width, 28)))
+        self.meter_label.setStringValue_(self._build_meter(0.0))
+        self.meter_label.setTextColor_(NSColor.colorWithRed_green_blue_alpha_(0.4, 0.8, 1.0, 1.0))
+        self.meter_label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(14, 0.0))
+        self.meter_label.setBezeled_(False)
+        self.meter_label.setDrawsBackground_(False)
+        self.meter_label.setEditable_(False)
+        self.meter_label.setSelectable_(False)
+        self.meter_label.setAlignment_(2)  # Center
+
+        self.window.contentView().addSubview_(self.title_label)
+        self.window.contentView().addSubview_(self.meter_label)
+
+    def _build_meter(self, level: float) -> str:
+        """Build the audio level meter string."""
+        # Clamp level between 0 and 1
+        level = max(0.0, min(1.0, level))
+        filled = int(level * self.METER_LENGTH)
+        empty = self.METER_LENGTH - filled
+        return self.METER_FILLED * filled + self.METER_EMPTY * empty
+
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as M:SS."""
+        mins = int(seconds) // 60
+        secs = int(seconds) % 60
+        return f"{mins}:{secs:02d}"
+
+    def _update_display(self) -> None:
+        """Update the timer and level meter display."""
+        if not self.is_visible or not APPKIT_AVAILABLE:
+            return
+
+        elapsed = time.time() - self.start_time
+        time_str = self._format_time(elapsed)
+        meter_str = self._build_meter(self.current_level)
+
+        def do_update() -> None:
+            if self.title_label:
+                self.title_label.setStringValue_(f"🎙️ Recording... {time_str}")
+            if self.meter_label:
+                self.meter_label.setStringValue_(meter_str)
+                # Color changes based on level (blue -> green -> yellow -> red)
+                if self.current_level < 0.3:
+                    color = NSColor.colorWithRed_green_blue_alpha_(0.4, 0.8, 1.0, 1.0)  # Blue
+                elif self.current_level < 0.6:
+                    color = NSColor.colorWithRed_green_blue_alpha_(0.4, 1.0, 0.6, 1.0)  # Green
+                elif self.current_level < 0.85:
+                    color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.9, 0.3, 1.0)  # Yellow
+                else:
+                    color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.4, 0.4, 1.0)  # Red
+                self.meter_label.setTextColor_(color)
+
+        try:
+            AppHelper.callAfter(do_update)
+        except Exception as e:
+            logger.debug(f"Error updating display: {e}")
+
+        # Schedule next update
+        if self.is_visible:
+            self.update_timer = threading.Timer(0.05, self._update_display)
+            self.update_timer.daemon = True
+            self.update_timer.start()
+
+    def update_level(self, level: float) -> None:
+        """Update the current audio level (0.0 to 1.0)."""
+        self.current_level = level
 
     def _do_show(self) -> None:
         if self.window:
@@ -175,15 +252,25 @@ class OverlayController:
             self.window.orderOut_(None)
 
     def show(self) -> None:
-        """Show the overlay window."""
+        """Show the overlay window and start updates."""
         if self.window and APPKIT_AVAILABLE:
             try:
+                self.start_time = time.time()
+                self.current_level = 0.0
+                self.is_visible = True
                 AppHelper.callAfter(self._do_show)
+                # Start update loop
+                self._update_display()
             except Exception as e:
                 logger.error(f"Error showing overlay: {e}")
 
     def hide(self) -> None:
-        """Hide the overlay window."""
+        """Hide the overlay window and stop updates."""
+        self.is_visible = False
+        if self.update_timer:
+            self.update_timer.cancel()
+            self.update_timer = None
+
         if self.window and APPKIT_AVAILABLE:
             try:
                 AppHelper.callAfter(self._do_hide)
@@ -278,6 +365,20 @@ class VoiceRecorder:
                     threading.Thread(target=self.stop_recording).start()
                     return
                 self.audio_data.append(indata.copy())
+
+            # Calculate and update audio level for the overlay
+            if self.overlay:
+                # RMS (Root Mean Square) for audio level
+                rms = np.sqrt(np.mean(indata ** 2))
+                # Scale RMS to 0-1 range (typical speech is 0.01-0.1 RMS)
+                # Using log scale for better visual response
+                if rms > 0:
+                    db = 20 * np.log10(rms + 1e-10)
+                    # Map -60dB to 0dB range to 0-1
+                    level = max(0.0, min(1.0, (db + 60) / 60))
+                else:
+                    level = 0.0
+                self.overlay.update_level(level)
 
     def update_status(self, status: str) -> None:
         """Update app status via callback."""
