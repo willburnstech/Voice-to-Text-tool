@@ -210,7 +210,9 @@ class OverlayController:
 
         elapsed = time.time() - self.start_time
         time_str = self._format_time(elapsed)
-        meter_str = self._build_meter(self.current_level)
+        # Capture level once to avoid race between meter and color
+        level = self.current_level
+        meter_str = self._build_meter(level)
 
         def do_update() -> None:
             if self.title_label:
@@ -218,11 +220,11 @@ class OverlayController:
             if self.meter_label:
                 self.meter_label.setStringValue_(meter_str)
                 # Color changes based on level (blue -> green -> yellow -> red)
-                if self.current_level < 0.3:
+                if level < 0.3:
                     color = NSColor.colorWithRed_green_blue_alpha_(0.4, 0.8, 1.0, 1.0)  # Blue
-                elif self.current_level < 0.6:
+                elif level < 0.6:
                     color = NSColor.colorWithRed_green_blue_alpha_(0.4, 1.0, 0.6, 1.0)  # Green
-                elif self.current_level < 0.85:
+                elif level < 0.85:
                     color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.9, 0.3, 1.0)  # Yellow
                 else:
                     color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.4, 0.4, 1.0)  # Red
@@ -610,6 +612,8 @@ class VoicePasteApp(rumps.App):
     def reset_audio(self, _: Any) -> None:
         """Reset the audio engine to clear any stuck state."""
         logger.info("Resetting audio engine...")
+        # Hide overlay if visible
+        self.overlay.hide()
         with self.recorder.lock:
             self.recorder.recording = False
             self.recorder.processing = False
