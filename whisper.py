@@ -255,16 +255,17 @@ class OverlayController:
 
     def show(self) -> None:
         """Show the overlay window and start updates."""
-        if self.window and APPKIT_AVAILABLE:
-            try:
-                self.start_time = time.time()
-                self.current_level = 0.0
-                self.is_visible = True
-                AppHelper.callAfter(self._do_show)
-                # Start update loop
-                self._update_display()
-            except Exception as e:
-                logger.error(f"Error showing overlay: {e}")
+        if not self.window:
+            return
+        try:
+            self.start_time = time.time()
+            self.current_level = 0.0
+            self.is_visible = True
+            AppHelper.callAfter(self._do_show)
+            # Start update loop
+            self._update_display()
+        except Exception as e:
+            logger.error(f"Error showing overlay: {e}")
 
     def hide(self) -> None:
         """Hide the overlay window and stop updates."""
@@ -273,7 +274,7 @@ class OverlayController:
             self.update_timer.cancel()
             self.update_timer = None
 
-        if self.window and APPKIT_AVAILABLE:
+        if self.window:
             try:
                 AppHelper.callAfter(self._do_hide)
             except Exception as e:
@@ -327,7 +328,6 @@ class VoiceRecorder:
         self.stream: sd.InputStream | None = None
         self.app_callback: Callable[[str], None] | None = app_callback
         self.overlay: OverlayController | None = overlay
-        self.running: bool = True
 
         # Start the persistent audio stream
         self._start_stream()
@@ -392,11 +392,6 @@ class VoiceRecorder:
         with self.lock:
             return self.recording
 
-    def is_busy(self) -> bool:
-        """Check if recording or processing."""
-        with self.lock:
-            return self.recording or self.processing
-
     def start_recording(self) -> bool:
         """Start recording immediately."""
         with self.lock:
@@ -404,7 +399,6 @@ class VoiceRecorder:
                 return False
 
             self.recording = True
-            self.processing = False
             self.audio_data = []
             logger.info("Starting recording...")
 
@@ -432,7 +426,6 @@ class VoiceRecorder:
 
     def close(self) -> None:
         """Clean up resources."""
-        self.running = False
         if self.stream:
             try:
                 self.stream.stop()
