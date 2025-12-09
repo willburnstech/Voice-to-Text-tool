@@ -38,7 +38,7 @@ class Config:
     sample_rate: int = 16000  # Hz
     max_recording_seconds: int = 30
     min_recording_seconds: float = 0.5  # Skip accidental taps
-    transcription_model: str = "gpt-4o-transcribe"
+    transcription_model: str = "whisper-1"
     api_max_retries: int = 2
     cache_dir: Path = Path("~/Library/Caches/voice-paste").expanduser()
 
@@ -104,7 +104,8 @@ client = validate_api_key()
 try:
     from AppKit import (
         NSWindow, NSFloatingWindowLevel, NSWindowStyleMaskBorderless,
-        NSBackingStoreBuffered, NSColor, NSTextField, NSFont, NSScreen
+        NSBackingStoreBuffered, NSColor, NSTextField, NSFont, NSScreen,
+        NSTextAlignmentCenter
     )
     from PyObjCTools import AppHelper
     APPKIT_AVAILABLE = True
@@ -173,7 +174,7 @@ class OverlayController:
         self.title_label.setDrawsBackground_(False)
         self.title_label.setEditable_(False)
         self.title_label.setSelectable_(False)
-        self.title_label.setAlignment_(2)  # Center
+        self.title_label.setAlignment_(NSTextAlignmentCenter)
 
         # Audio level meter label
         self.meter_label = NSTextField.alloc().initWithFrame_(((0, 12), (width, 28)))
@@ -184,7 +185,7 @@ class OverlayController:
         self.meter_label.setDrawsBackground_(False)
         self.meter_label.setEditable_(False)
         self.meter_label.setSelectable_(False)
-        self.meter_label.setAlignment_(2)  # Center
+        self.meter_label.setAlignment_(NSTextAlignmentCenter)
 
         self.window.contentView().addSubview_(self.title_label)
         self.window.contentView().addSubview_(self.meter_label)
